@@ -1,22 +1,3 @@
-# timeboundmap
-
-A Map data structure with expiration cleanup
-
-## Benchmark
-
-```text
-goos: darwin
-goarch: amd64
-pkg: github.com/ulyyyyyy/timeboundmap
-cpu: Intel(R) Core(TM) i5-8259U CPU @ 2.30GHz
-
-BenchmarkTimeBoundMap_Set-8   	 1000000	      1444 ns/op
-BenchmarkTimeBoundMap_Get-8   	 1522558	      1130 ns/op
-```
-
-## Example
-
-```go
 package timeboundmap
 
 import (
@@ -27,6 +8,54 @@ import (
 	"testing"
 	"time"
 )
+
+func BenchmarkTimeBoundMap_Set(b *testing.B) {
+	b.StopTimer()
+
+	tbm := New(30 * time.Minute)
+	lifetime := time.Minute
+
+	b.StartTimer()
+
+	for i := 0; i < b.N; i++ {
+		tbm.Set(randStr(), r.Uint64(), lifetime)
+	}
+
+	b.StopTimer()
+
+	if tbm.Len() != b.N {
+		b.FailNow()
+	}
+}
+
+func BenchmarkTimeBoundMap_Get(b *testing.B) {
+	b.StopTimer()
+
+	tbm := New(30 * time.Minute)
+	lifetime := time.Minute
+	keys := make([]string, b.N)
+	for i := range keys {
+		k := randStr()
+		v := r.Uint64()
+		keys[i] = k
+		tbm.Set(k, v, lifetime)
+	}
+	fnRandKey := func() string {
+		return keys[r.Intn(len(keys))]
+	}
+
+	b.StartTimer()
+
+	for i := 0; i < b.N; i++ {
+		tbm.Get(fnRandKey())
+	}
+
+	b.StopTimer()
+
+	if tbm.Len() != b.N {
+		b.FailNow()
+	}
+}
 
 var r = rand.New(rand.NewSource(time.Now().Unix()))
 
@@ -94,5 +123,3 @@ func BenchmarkCounter(b *testing.B) {
 	// BenchmarkCounter
 	// BenchmarkCounter-8   	 2316027	       742.3 ns/op
 }
-
-```
