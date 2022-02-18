@@ -1,258 +1,248 @@
 package timeboundmap
 
 import (
+	"hash/maphash"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// TimeBoundMap
-type TimeBoundMap struct {
-	mu sync.RWMutex
+const defaultSegmentCount = 16
 
-	cursor  int
-	buckets []map[extKey]*extValue
+var _ TimeBoundMap = (*timeBoundMap)(nil)
 
-	valuePool *sync.Pool
-
-	fnOnCleaned func(elapsed time.Duration, cleaning, remaining uint64)
-}
-
-// New make a New boundMap with expire time
-func New(cleanInterval time.Duration, opts ...Option) *TimeBoundMap {
-	opt := defaultOption()
-	for _, fn := range opts {
-		fn(opt)
-	}
-
-	buckets := make([]map[extKey]*extValue, opt.bucketTotal)
-	for i := range buckets {
-		buckets[i] = make(map[extKey]*extValue, opt.bucketSize)
-	}
-
-	tbm := &TimeBoundMap{
-		cursor:  0,
-		buckets: buckets,
-		valuePool: &sync.Pool{
-			New: func() interface{} {
-				return new(extValue)
-			},
-		},
-		fnOnCleaned: opt.fnOnCleaned,
-	}
-	go tbm.startCleaner(cleanInterval)
-	return tbm
-}
-
-type option struct {
-	bucketTotal int
-	bucketSize  int
-	fnOnCleaned func(elapsed time.Duration, cleaning, remaining uint64)
-}
-
-func defaultOption() *option {
-	return &option{
-		bucketTotal: 1,
-		bucketSize:  256,
-	}
+type timeBoundMap struct {
+	segments []*segment
+	hashPool *sync.Pool
+	seed     maphash.Seed
+	opt      *option
 }
 
 type Option func(*option)
 
-// WithBucketTotal init the number of buckets
-func WithBucketTotal(n int) Option {
-	if n <= 0 {
-		n = 1
-	}
-	return func(opt *option) {
-		opt.bucketTotal = n
+func defaultOption() *option {
+	return &option{
+		segmentSize:    defaultSegmentCount,
+		fnOnClearingUp: nil,
 	}
 }
 
-// WithBucketSize init the size of each bucket
-func WithBucketSize(s int) Option {
-	if s <= 0 {
-		s = 256
+type option struct {
+	segmentSize    uint64
+	fnOnClearingUp func(elapsed time.Duration, removed, remaining uint64)
+}
+
+func WithSegmentSize(n int) Option {
+	if n <= 0 || n%2 != 0 {
+		n = defaultSegmentCount
 	}
 	return func(opt *option) {
-		opt.bucketSize = s
+		opt.segmentSize = uint64(n)
 	}
 }
 
-// WithOnCleaned init function when bucket cleaning up
-func WithOnCleaned(fn func(elapsed time.Duration, cleaning, remaining uint64)) Option {
+func WithOnClearingUp(fn func(elapsed time.Duration, removed, remaining uint64)) Option {
 	return func(opt *option) {
-		opt.fnOnCleaned = fn
+		opt.fnOnClearingUp = fn
 	}
 }
 
-// Set the key & value into bucketMap. the callbackFunc is executed when the key is deleted.
-func (tbm *TimeBoundMap) Set(key, value interface{}, lifeDuration time.Duration, cb ...CallbackFunc) {
-	expiration := time.Now().Add(lifeDuration)
-	var fn CallbackFunc
-	if len(cb) > 0 {
-		fn = cb[0]
+func New(cleanInterval time.Duration, opts ...Option) TimeBoundMap {
+	tbm := &timeBoundMap{
+		hashPool: &sync.Pool{New: func() interface{} { return new(maphash.Hash) }},
+		seed:     maphash.MakeSeed(),
+		opt:      defaultOption(),
+	}
+	for _, fn := range opts {
+		if fn == nil {
+			continue
+		}
+		fn(tbm.opt)
 	}
 
-	// compute if absent
-	if _, v := tbm.get(key); v != nil {
-		v.value = value
-		v.expiration = expiration
-		v.cb = fn
+	tbm.segments = make([]*segment, tbm.opt.segmentSize)
+	for i := range tbm.segments {
+		tbm.segments[i] = &segment{bucket: make(map[interface{}]*extValue)}
+	}
+
+	go tbm.startRemover(cleanInterval)
+
+	return tbm
+}
+
+func (tbm *timeBoundMap) Set(key, value interface{}, lifetime time.Duration, onCleaned ...CallbackFunc) {
+	var (
+		expiration = time.Now().Add(lifetime)
+		cb         CallbackFunc
+		s          = tbm.getSegment(key)
+	)
+	if len(onCleaned) > 0 {
+		cb = onCleaned[0]
+	}
+
+	ev := newExtValue(value, expiration, cb)
+
+	s.set(key, ev)
+}
+
+func (tbm *timeBoundMap) UnsafeSet(key, value interface{}, lifetime time.Duration, onCleaned ...CallbackFunc) {
+	var (
+		expiration = time.Now().Add(lifetime)
+		cb         CallbackFunc
+		s          = tbm.getSegment(key)
+	)
+	if len(onCleaned) > 0 {
+		cb = onCleaned[0]
+	}
+
+	ev := newExtValue(value, expiration, cb)
+
+	s.unsafeSet(key, ev)
+}
+
+func (tbm *timeBoundMap) Get(key interface{}) (value interface{}, ok bool) {
+	var s = tbm.getSegment(key)
+
+	extVal, ok := s.get(key)
+	if !ok {
+		return nil, false
+	}
+
+	if time.Now().After(extVal.expiration) {
+		s.remove(key, extVal)
+		return nil, false
+	}
+
+	return extVal.val, ok
+}
+
+func (tbm *timeBoundMap) UnsafeGet(key interface{}) (value interface{}, ok bool) {
+	var s = tbm.getSegment(key)
+
+	extVal, ok := s.unsafeGet(key)
+	if !ok {
+		return nil, false
+	}
+
+	if time.Now().After(extVal.expiration) {
+		s.remove(key, extVal)
+		return nil, false
+	}
+
+	return extVal.val, ok
+}
+
+func (tbm *timeBoundMap) GetToDoWithLock(key interface{}, do func(value interface{}, ok bool)) {
+	var s = tbm.getSegment(key)
+
+	s.Lock()
+	defer s.Unlock()
+
+	extVal, ok := s.bucket[key]
+	if !ok {
+		do(nil, ok)
 		return
 	}
 
-	var k extKey
-
-	tbm.mu.Lock()
-	defer tbm.mu.Unlock()
-
-	k.bucketIdx = tbm.cursor
-	k.key = key
-
-	maxIdx := len(tbm.buckets) - 1
-	if tbm.cursor+1 > maxIdx {
-		tbm.cursor = 0
-	} else {
-		tbm.cursor++
+	if time.Now().After(extVal.expiration) {
+		s.unsafeRemove(key, extVal)
+		do(nil, false)
+		return
 	}
 
-	v := tbm.valuePool.Get().(*extValue)
-	v.value = value
-	v.expiration = expiration
-	v.cb = fn
-	tbm.buckets[k.bucketIdx][k] = v
+	do(extVal.val, true)
 }
 
-// Get the value and exist result
-func (tbm *TimeBoundMap) Get(key interface{}) (value interface{}, ok bool) {
-	k, v := tbm.get(key)
-	if v == nil {
-		return nil, false
-	}
+func (tbm *timeBoundMap) getSegment(key interface{}) *segment {
+	h := tbm.hashPool.Get().(*maphash.Hash)
+	h.SetSeed(tbm.seed)
+	defer func() {
+		h.Reset()
+		tbm.hashPool.Put(h)
+	}()
 
-	if time.Now().After(v.expiration) {
-		tbm.mu.Lock()
-		defer tbm.mu.Unlock()
-		tbm.deleteValue(k, v)
-		return nil, false
-	}
+	// never fails
+	_, _ = h.Write(extKey{val: key}.Bytes())
 
-	return v.value, true
+	idx := h.Sum64() % tbm.opt.segmentSize
+	return tbm.segments[idx]
 }
 
-func (tbm *TimeBoundMap) get(key interface{}) (k extKey, v *extValue) {
-	var ok bool
-
-	tbm.mu.RLock()
-
-	fn := func() {
-		for i := range tbm.buckets {
-			_k := extKey{
-				bucketIdx: i,
-				key:       key,
-			}
-			_v, _ok := tbm.buckets[i][_k]
-			if _ok {
-				ok = true
-				k = _k
-				v = _v
-				return
-			}
-		}
-	}
-	fn()
-
-	tbm.mu.RUnlock()
-
-	if !ok {
-		return extKey{}, nil
-	} else {
-		return k, v
-	}
-}
-
-// Len calc the Len for the buckets
-func (tbm *TimeBoundMap) Len() int {
-	var num int
-	for _, bucket := range tbm.buckets {
-		num += len(bucket)
-	}
-	return num
-}
-
-// Snapshot
-func (tbm *TimeBoundMap) Snapshot() map[interface{}]interface{} {
-	m := make(map[interface{}]interface{}, tbm.Len())
-
-	tbm.mu.RLock()
-	defer tbm.mu.RUnlock()
-
-	for _, bucket := range tbm.buckets {
-		for k, v := range bucket {
-			m[k.key] = v.value
-		}
-	}
-
-	return m
-}
-
-func (tbm *TimeBoundMap) startCleaner(d time.Duration) {
-	ticker := time.NewTicker(d)
-
-	for {
-		select {
-		case <-ticker.C:
-			tbm.cleanup()
-		}
-	}
-}
-
-// cleanup clean up the expired key.
-func (tbm *TimeBoundMap) cleanup() {
-	now := time.Now()
-
-	// lock buckets
-	tbm.mu.Lock()
-	defer tbm.mu.Unlock()
-
-	var wg sync.WaitGroup
-	wg.Add(len(tbm.buckets))
-
+func (tbm *timeBoundMap) Len() int {
 	var (
 		count uint64
-		start = time.Now()
+		wg    sync.WaitGroup
 	)
-	atomic.StoreUint64(&count, 0)
+	wg.Add(len(tbm.segments))
 
-	for i := range tbm.buckets {
-		go func(i int) {
-			for k, v := range tbm.buckets[i] {
-				// 如果所有桶exp时间过期，则统计一次，删除对应key
-				if now.After(v.expiration) {
-					atomic.AddUint64(&count, 1)
-					tbm.deleteValue(k, v)
-				}
-			}
-			wg.Done()
-		}(i)
+	for i := range tbm.segments {
+		go func(s *segment) {
+			defer wg.Done()
+			atomic.AddUint64(&count, uint64(len(s.bucket)))
+		}(tbm.segments[i])
 	}
 
 	wg.Wait()
 
-	if tbm.fnOnCleaned != nil {
-		tbm.fnOnCleaned(time.Now().Sub(start), atomic.LoadUint64(&count), uint64(tbm.Len()))
+	return int(count)
+}
+
+func (tbm *timeBoundMap) Snapshot() map[interface{}]interface{} {
+	m := make(map[interface{}]interface{}, 1024)
+	for _, s := range tbm.segments {
+		s.RLock()
+		for k, extVal := range s.bucket {
+			m[k] = extVal.val
+		}
+		s.RUnlock()
+	}
+	return m
+}
+
+func (tbm *timeBoundMap) startRemover(cleanInterval time.Duration) {
+	ticker := time.NewTicker(cleanInterval)
+	for {
+		select {
+		case <-ticker.C:
+			tbm.remove()
+		}
 	}
 }
 
-// deleteValue do callback function & delete the expired key
-func (tbm *TimeBoundMap) deleteValue(extK extKey, extV *extValue) {
-	if extV.cb != nil {
-		extV.cb(extK.key, extV.value)
+func (tbm *timeBoundMap) remove() {
+	now := time.Now()
+
+	var (
+		wg                 sync.WaitGroup
+		removed, remaining uint64 = 0, 0
+		start                     = time.Now()
+	)
+	wg.Add(len(tbm.segments))
+
+	for i := range tbm.segments {
+		go func(s *segment) {
+			defer wg.Done()
+
+			s.Lock()
+
+			for k, v := range s.bucket {
+				if now.After(v.expiration) {
+					atomic.AddUint64(&removed, 1)
+					s.unsafeRemove(k, v)
+				} else {
+					atomic.AddUint64(&remaining, 1)
+				}
+			}
+
+			s.Unlock()
+		}(tbm.segments[i])
 	}
 
-	// put value to Pool
-	tbm.valuePool.Put(extV)
-	// delete buckets date By extKey
-	delete(tbm.buckets[extK.bucketIdx], extK)
+	wg.Wait()
+
+	if tbm.opt.fnOnClearingUp != nil {
+		go func() {
+			tbm.opt.fnOnClearingUp(time.Now().Sub(start), atomic.LoadUint64(&removed), atomic.LoadUint64(&remaining))
+		}()
+	}
 }
