@@ -1,6 +1,9 @@
 # timeboundmap
 
-A Map data structure with expiration cleanup
+timeboundmap is safe for concurrent user by multiple goroutines without additional locking or coordination.
+
+it can be used for timed cleaning the key which you want to ignore, like TTL.
+
 
 ## Benchmark
 
@@ -62,7 +65,7 @@ func BenchmarkCounter(b *testing.B) {
 		key := fnRandKey()
 		go func(key string) {
 			defer wg.Done()
-			tbm.GetToDoWithLock(key, func(value interface{}, ok bool) {
+			tbm.GetToDoWithLock(key, func(value any, ok bool) {
 				if !ok {
 					cv := testData[key] + 1
 					tbm.UnsafeSet(key, &cv, 10*time.Minute)
@@ -96,3 +99,5 @@ func BenchmarkCounter(b *testing.B) {
 }
 
 ```
+
+Please open the test package, if u need to learn more information. 
