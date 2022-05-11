@@ -8,37 +8,38 @@ import (
 )
 
 type TimeBoundMap interface {
-	Set(key, value interface{}, lifetime time.Duration, onCleaned ...CallbackFunc)
-	Get(key interface{}) (value interface{}, ok bool)
+	Set(key, value any, lifetime time.Duration, onCleaned ...CallbackFunc)
+	Get(key any) (value any, ok bool)
 
-	GetToDoWithLock(key interface{}, do func(value interface{}, ok bool))
-	UnsafeSet(key, value interface{}, lifetime time.Duration, onCleaned ...CallbackFunc)
-	UnsafeGet(key interface{}) (value interface{}, ok bool)
+	GetToDoWithLock(key any, do func(value any, ok bool))
+	UnsafeSet(key, value any, lifetime time.Duration, onCleaned ...CallbackFunc)
+	UnsafeGet(key any) (value any, ok bool)
 
 	Len() int
-	Snapshot() map[interface{}]interface{}
+	Snapshot() map[any]any
 }
 
-type CallbackFunc func(key, value interface{})
+type CallbackFunc func(key, value any)
 
 type extValue struct {
-	val        interface{}
+	val        any
 	expiration time.Time
 	cb         CallbackFunc
 }
 
-func newExtValue(val interface{}, expiration time.Time, cb CallbackFunc) *extValue {
+func newExtValue(val any, expiration time.Time, cb CallbackFunc) *extValue {
 	return &extValue{
 		val:        val,
 		expiration: expiration,
-		cb:         cb,
+		cb:         cb, // onCleaned function
 	}
 }
 
 type extKey struct {
-	val interface{}
+	val any
 }
 
+// Bytes Convert key to Bytes
 func (k extKey) Bytes() []byte {
 	switch v := k.val.(type) {
 	case string:
