@@ -9,6 +9,26 @@ import (
 	"time"
 )
 
+func TestNewTimeBoundMap(t *testing.T) {
+	tbm := New(1*time.Second,
+		WithSegmentSize(5),
+		WithOnClearingUp(func(elapsed time.Duration, removed, remaining uint64) {
+			fmt.Printf("elapsed time: %v, removed %d keys and remaining %d keys\n", elapsed, removed, remaining)
+		}),
+	)
+
+	tbm.Set(1, "one", 2*time.Second, func(key, value any) {
+		fmt.Printf("key: %v has been removed. The value is %v\n", key, value)
+	})
+
+	tbm.Get(1)
+	fmt.Println(tbm.Snapshot())
+	time.Sleep(2500 * time.Millisecond)
+
+	tbm.Get(1)
+	fmt.Println(tbm.Snapshot())
+}
+
 func BenchmarkTimeBoundMap_Set(b *testing.B) {
 	b.StopTimer()
 
@@ -91,7 +111,7 @@ func BenchmarkCounter(b *testing.B) {
 		key := fnRandKey()
 		go func(key string) {
 			defer wg.Done()
-			tbm.GetToDoWithLock(key, func(value interface{}, ok bool) {
+			tbm.GetToDoWithLock(key, func(value any, ok bool) {
 				if !ok {
 					cv := testData[key] + 1
 					tbm.UnsafeSet(key, &cv, 10*time.Minute)
