@@ -7,28 +7,28 @@ import (
 	"time"
 )
 
-type TimeBoundMap interface {
-	Set(key, value interface{}, lifetime time.Duration, onCleaned ...CallbackFunc)
-	Get(key interface{}) (value interface{}, ok bool)
+type TimeBoundMap[K comparable, V any] interface {
+	Set(key K, value V, lifetime time.Duration, onCleaned ...CallbackFunc)
+	Get(key K) (value V, ok bool)
 
-	GetToDoWithLock(key interface{}, do func(value interface{}, ok bool))
-	UnsafeSet(key, value interface{}, lifetime time.Duration, onCleaned ...CallbackFunc)
-	UnsafeGet(key interface{}) (value interface{}, ok bool)
+	GetToDoWithLock(key K, do func(value V, ok bool))
+	UnsafeSet(key K, value V, lifetime time.Duration, onCleaned ...CallbackFunc)
+	UnsafeGet(key K) (value V, ok bool)
 
 	Len() int
-	Snapshot() map[interface{}]interface{}
+	Snapshot() map[K]V
 }
 
 type CallbackFunc func(key, value interface{})
 
-type extValue struct {
-	val        interface{}
+type extValue[V any] struct {
+	val        V
 	expiration time.Time
 	cb         CallbackFunc
 }
 
-func newExtValue(val interface{}, expiration time.Time, cb CallbackFunc) *extValue {
-	return &extValue{
+func newExtValue[V any](val V, expiration time.Time, cb CallbackFunc) *extValue[V] {
+	return &extValue[V]{
 		val:        val,
 		expiration: expiration,
 		cb:         cb,

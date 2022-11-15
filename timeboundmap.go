@@ -9,10 +9,8 @@ import (
 
 const defaultSegmentCount = 16
 
-var _ TimeBoundMap = (*timeBoundMap)(nil)
-
-type timeBoundMap struct {
-	segments []*segment
+type timeBoundMap[K comparable, V any] struct {
+	segments []*segment[K, V]
 	hashPool *sync.Pool
 	seed     maphash.Seed
 	opt      *option
@@ -47,8 +45,8 @@ func WithOnClearingUp(fn func(elapsed time.Duration, removed, remaining uint64))
 	}
 }
 
-func New(cleanInterval time.Duration, opts ...Option) TimeBoundMap {
-	tbm := &timeBoundMap{
+func New[K comparable, V any](cleanInterval time.Duration, opts ...Option) TimeBoundMap[K, V] {
+	tbm := &timeBoundMap[K, V]{
 		hashPool: &sync.Pool{New: func() interface{} { return new(maphash.Hash) }},
 		seed:     maphash.MakeSeed(),
 		opt:      defaultOption(),
@@ -60,9 +58,9 @@ func New(cleanInterval time.Duration, opts ...Option) TimeBoundMap {
 		fn(tbm.opt)
 	}
 
-	tbm.segments = make([]*segment, tbm.opt.segmentSize)
+	tbm.segments = make([]*segment[K, V], tbm.opt.segmentSize)
 	for i := range tbm.segments {
-		tbm.segments[i] = &segment{bucket: make(map[interface{}]*extValue)}
+		tbm.segments[i] = &segment[K, V]{bucket: make(map[K]*extValue[V])}
 	}
 
 	go tbm.startRemover(cleanInterval)
@@ -70,7 +68,7 @@ func New(cleanInterval time.Duration, opts ...Option) TimeBoundMap {
 	return tbm
 }
 
-func (tbm *timeBoundMap) Set(key, value interface{}, lifetime time.Duration, onCleaned ...CallbackFunc) {
+func (tbm *timeBoundMap[K, V]) Set(key K, value V, lifetime time.Duration, onCleaned ...CallbackFunc) {
 	var (
 		expiration = time.Now().Add(lifetime)
 		cb         CallbackFunc
@@ -80,12 +78,12 @@ func (tbm *timeBoundMap) Set(key, value interface{}, lifetime time.Duration, onC
 		cb = onCleaned[0]
 	}
 
-	ev := newExtValue(value, expiration, cb)
+	ev := newExtValue[V](value, expiration, cb)
 
 	s.set(key, ev)
 }
 
-func (tbm *timeBoundMap) UnsafeSet(key, value interface{}, lifetime time.Duration, onCleaned ...CallbackFunc) {
+func (tbm *timeBoundMap[K, V]) UnsafeSet(key K, value V, lifetime time.Duration, onCleaned ...CallbackFunc) {
 	var (
 		expiration = time.Now().Add(lifetime)
 		cb         CallbackFunc
@@ -95,44 +93,44 @@ func (tbm *timeBoundMap) UnsafeSet(key, value interface{}, lifetime time.Duratio
 		cb = onCleaned[0]
 	}
 
-	ev := newExtValue(value, expiration, cb)
+	ev := newExtValue[V](value, expiration, cb)
 
 	s.unsafeSet(key, ev)
 }
 
-func (tbm *timeBoundMap) Get(key interface{}) (value interface{}, ok bool) {
+func (tbm *timeBoundMap[K, V]) Get(key K) (value V, ok bool) {
 	var s = tbm.getSegment(key)
 
 	extVal, ok := s.get(key)
 	if !ok {
-		return nil, false
+		return
 	}
 
 	if time.Now().After(extVal.expiration) {
 		s.remove(key, extVal)
-		return nil, false
+		return
 	}
 
 	return extVal.val, ok
 }
 
-func (tbm *timeBoundMap) UnsafeGet(key interface{}) (value interface{}, ok bool) {
+func (tbm *timeBoundMap[K, V]) UnsafeGet(key K) (value V, ok bool) {
 	var s = tbm.getSegment(key)
 
 	extVal, ok := s.unsafeGet(key)
 	if !ok {
-		return nil, false
+		return
 	}
 
 	if time.Now().After(extVal.expiration) {
 		s.remove(key, extVal)
-		return nil, false
+		return
 	}
 
 	return extVal.val, ok
 }
 
-func (tbm *timeBoundMap) GetToDoWithLock(key interface{}, do func(value interface{}, ok bool)) {
+func (tbm *timeBoundMap[K, V]) GetToDoWithLock(key K, do func(value V, ok bool)) {
 	var s = tbm.getSegment(key)
 
 	s.Lock()
@@ -140,20 +138,22 @@ func (tbm *timeBoundMap) GetToDoWithLock(key interface{}, do func(value interfac
 
 	extVal, ok := s.bucket[key]
 	if !ok {
-		do(nil, ok)
+		var zero V
+		do(zero, ok)
 		return
 	}
 
 	if time.Now().After(extVal.expiration) {
 		s.unsafeRemove(key, extVal)
-		do(nil, false)
+		var zero V
+		do(zero, false)
 		return
 	}
 
 	do(extVal.val, true)
 }
 
-func (tbm *timeBoundMap) getSegment(key interface{}) *segment {
+func (tbm *timeBoundMap[K, V]) getSegment(key K) *segment[K, V] {
 	h := tbm.hashPool.Get().(*maphash.Hash)
 	h.SetSeed(tbm.seed)
 	defer func() {
@@ -168,7 +168,7 @@ func (tbm *timeBoundMap) getSegment(key interface{}) *segment {
 	return tbm.segments[idx]
 }
 
-func (tbm *timeBoundMap) Len() int {
+func (tbm *timeBoundMap[K, V]) Len() int {
 	var (
 		count uint64
 		wg    sync.WaitGroup
@@ -176,7 +176,7 @@ func (tbm *timeBoundMap) Len() int {
 	wg.Add(len(tbm.segments))
 
 	for i := range tbm.segments {
-		go func(s *segment) {
+		go func(s *segment[K, V]) {
 			defer wg.Done()
 			atomic.AddUint64(&count, uint64(len(s.bucket)))
 		}(tbm.segments[i])
@@ -187,8 +187,8 @@ func (tbm *timeBoundMap) Len() int {
 	return int(count)
 }
 
-func (tbm *timeBoundMap) Snapshot() map[interface{}]interface{} {
-	m := make(map[interface{}]interface{}, 1024)
+func (tbm *timeBoundMap[K, V]) Snapshot() map[K]V {
+	m := make(map[K]V, 1024)
 	for _, s := range tbm.segments {
 		s.RLock()
 		for k, extVal := range s.bucket {
@@ -199,7 +199,7 @@ func (tbm *timeBoundMap) Snapshot() map[interface{}]interface{} {
 	return m
 }
 
-func (tbm *timeBoundMap) startRemover(cleanInterval time.Duration) {
+func (tbm *timeBoundMap[K, V]) startRemover(cleanInterval time.Duration) {
 	ticker := time.NewTicker(cleanInterval)
 	for {
 		select {
@@ -209,7 +209,7 @@ func (tbm *timeBoundMap) startRemover(cleanInterval time.Duration) {
 	}
 }
 
-func (tbm *timeBoundMap) remove() {
+func (tbm *timeBoundMap[K, V]) remove() {
 	now := time.Now()
 
 	var (
@@ -220,7 +220,7 @@ func (tbm *timeBoundMap) remove() {
 	wg.Add(len(tbm.segments))
 
 	for i := range tbm.segments {
-		go func(s *segment) {
+		go func(s *segment[K, V]) {
 			defer wg.Done()
 
 			s.Lock()

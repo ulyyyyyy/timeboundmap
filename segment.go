@@ -4,36 +4,36 @@ import (
 	"sync"
 )
 
-type segment struct {
+type segment[K comparable, V any] struct {
 	sync.RWMutex
-	bucket map[interface{}]*extValue
+	bucket map[K]*extValue[V]
 }
 
-func (s *segment) set(key interface{}, value *extValue) {
+func (s *segment[K, V]) set(key K, value *extValue[V]) {
 	s.Lock()
 	s.bucket[key] = value
 	s.Unlock()
 }
 
-func (s *segment) unsafeSet(key interface{}, value *extValue) {
+func (s *segment[K, V]) unsafeSet(key K, value *extValue[V]) {
 	s.bucket[key] = value
 }
 
-func (s *segment) get(key interface{}) (extVal *extValue, ok bool) {
+func (s *segment[K, V]) get(key K) (extVal *extValue[V], ok bool) {
 	s.RLock()
 	extVal, ok = s.bucket[key]
 	s.RUnlock()
 	return
 }
 
-func (s *segment) unsafeGet(key interface{}) (extVal *extValue, ok bool) {
+func (s *segment[K, V]) unsafeGet(key K) (extVal *extValue[V], ok bool) {
 	extVal, ok = s.bucket[key]
 	return
 }
 
-func (s *segment) remove(key interface{}, value *extValue) {
+func (s *segment[K, V]) remove(key K, value *extValue[V]) {
 	if value.cb != nil {
-		go func(cb CallbackFunc, k, v interface{}) {
+		go func(cb CallbackFunc, k K, v V) {
 			cb(k, v)
 		}(value.cb, key, value.val)
 	}
@@ -43,9 +43,9 @@ func (s *segment) remove(key interface{}, value *extValue) {
 	s.Unlock()
 }
 
-func (s *segment) unsafeRemove(key interface{}, value *extValue) {
+func (s *segment[K, V]) unsafeRemove(key K, value *extValue[V]) {
 	if value.cb != nil {
-		go func(cb CallbackFunc, k, v interface{}) {
+		go func(cb CallbackFunc, k K, v V) {
 			cb(k, v)
 		}(value.cb, key, value.val)
 	}
